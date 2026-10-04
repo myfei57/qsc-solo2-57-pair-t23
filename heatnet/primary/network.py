@@ -92,6 +92,15 @@ class PrimaryNetwork:
         self._recalibrations += 1
         return self._baseline_t_h
 
+    def restore(
+        self, *, supply_c: float, return_c: float, flow_t_h: float
+    ) -> None:
+        """按落盘进度把一次网现场重建到内存（仅装配期恢复调用）。"""
+
+        self._supply_c = float(supply_c)
+        self._return_c = float(return_c)
+        self._flow_t_h = max(0.0, float(flow_t_h))
+
     def count_dispatch(self) -> int:
         """记一次下发。"""
 

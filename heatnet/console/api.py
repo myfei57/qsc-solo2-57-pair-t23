@@ -58,6 +58,7 @@ class Api:
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/startup/recovery", self._startup_recovery)
         add("POST", "/api/weather", self._weather)
         add("POST", "/api/adjust", self._adjust)
         add("POST", "/api/startup", self._startup)
@@ -249,6 +250,9 @@ class Api:
         return {"ready": all(checks.values()), "checks": checks, "info": info}
 
     # ---- 动作 ---------------------------------------------------------
+
+    def _startup_recovery(self, params: dict, body: dict) -> dict:
+        return self._platform.startup_recovery_report(refresh=True)
 
     def _weather(self, params: dict, body: dict) -> dict:
         return self._platform.push_weather(

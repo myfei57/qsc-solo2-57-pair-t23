@@ -7,6 +7,8 @@
             控制周期 → 流量标定 → 定压改造 → 二次网循环 → 热量采集与结算 →
             分区拆分 → 阀门队列回放 → 停机与复位），用于交付前的真实运行检查；
 ``status``  打印当前状态快照；
+``resume``  只做重启后的投运续作判定（参数核对 + 按阶段出决议），不动任何设备，
+            供现场确认"接着做还是退回去"；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
 """
@@ -161,6 +163,33 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_resume(args: argparse.Namespace) -> int:
+    """只出投运续作决议（迁移核对 + 按阶段判定），不动设备。"""
+
+    from .recovery import plan_resume
+
+    platform = _build(args)
+    progress = platform.startup_progress.load()
+    if progress and (args.outdoor_c is not None or args.demand_pct is not None):
+        # 现场显式给了新输入：用新输入核对迁移，而不是沿用落盘输入。
+        params = progress.get("params", {})
+        ctx = platform._startup_context(
+            float(params["outdoor_c"]) if args.outdoor_c is None else args.outdoor_c,
+            float(params["demand_pct"]) if args.demand_pct is None else args.demand_pct,
+        )
+        decision = plan_resume(ctx, platform.startup_progress, use_recorded_input=False)
+        platform._publish_decision(
+            platform.startup_progress.save_decision(decision.as_dict(), platform.clock.now())
+        )
+        _dump(platform.startup_recovery_report())
+        return 0 if decision.decision != "abort" else 3
+
+    # 默认沿落盘输入现算决议并落审计（refresh 内部完成）。
+    report = platform.startup_recovery_report(refresh=True)
+    _dump(report)
+    return 0 if report["decision"].get("decision") != "abort" else 3
+
+
 def _cmd_config(args: argparse.Namespace) -> int:
     config_path = getattr(args, "config", None)
     config = load_config(config_path) if config_path else default_config()
@@ -213,6 +242,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)
+
+    resume = sub.add_parser("resume", help="只做投运续作判定，不动设备", parents=[common])
+    resume.add_argument("--outdoor-c", type=float, default=None, help="用新的室外温度核对迁移")
+    resume.add_argument("--demand-pct", type=float, default=None, help="用新的负荷需求核对迁移")
+    resume.set_defaults(func=_cmd_resume)
 
     config = sub.add_parser("config", help="打印生效配置", parents=[common])
     config.set_defaults(func=_cmd_config)

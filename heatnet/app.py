@@ -31,9 +31,17 @@ from .quota.accumulator import QuotaAccumulator
 from .quota.billing import billing_lines
 from .quota.meter import HeatMeter
 from .quota.quota import QuotaLedger
+from .recovery import (
+    StartupContext,
+    StartupProgress,
+    field_snapshot,
+    plan_resume,
+    restore_field,
+    run_startup,
+)
 from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
-from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant, startup_plant
+from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant
 from .source.adjust import Adjustment, apply_adjustment
 from .source.source import HeatSource
 from .source.weather import WeatherPush, push_weather
@@ -86,6 +94,7 @@ class Platform:
         self.metrics = StoreMetrics(store.root)
         self.durable = DurableState(store)
         self.checkpoint = CommandCheckpoint(store)
+        self.startup_progress = StartupProgress(store)
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
@@ -181,12 +190,21 @@ class Platform:
             self.namespaces.register("quota", f"{name}.heat-meter", "heat-meter")
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数与阀门开度。"""
+        """从落盘状态恢复平台计数、在途投运现场与阀门开度。"""
 
         state = self.store.read("platform_state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        # 先按投运进度把设备现场重建到最后一个已提交阶段，再回放跳机记录：
+        # 有在途投运时以现场快照为准，避免冷态内存被随后的跳机回放误判成停机。
+        recovered_stage = restore_field(
+            self.startup_progress,
+            source=self.source,
+            curve=self.curve,
+            network=self.network,
+            loop=self.secondary,
+        )
         for name, valve in self.valves.items():
             load_valve(valve, self.durable)
             applied = self.checkpoint.load(name)
@@ -198,7 +216,9 @@ class Platform:
         except PlantError:
             return
         trips = [item for item in records if item.action == "trip"]
-        if trips:
+        # 已恢复到在途投运现场时，最近一次跳机若发生在本次投运开始之前，不能压过
+        # 现场快照；只有进度缺失或现场本身为停机态时才回放跳机。
+        if trips and not recovered_stage:
             reason = str(trips[-1].payload.get("reason", "unknown"))
             self.source.trip(reason)
 
@@ -292,26 +312,121 @@ class Platform:
         return self.shutdown("planned-shutdown")
 
     def startup(self, outdoor_c: float, demand_pct: float = 60.0, station: str = "console") -> dict:
-        """按调度链顺序把平台从冷态带到带负荷。"""
+        """按调度链顺序把平台从冷态带到带负荷（支持掉电后续作/退回）。
+
+        每次调用先只做判定（参数核对=迁移，按阶段出续作决议），把同一份决议落盘、
+        发审计并供控制台展示，然后才允许执行器动设备。
+        """
 
         with self._lock:
             op_id = self.ids.next()
-            report = startup_plant(
-                self.source,
-                self.curve,
-                self.network,
-                self.secondary,
-                self.pump,
-                self.valves[sorted(self.valves)[0]],
-                self.durable,
-                outdoor_c,
-                self.clock.now(),
-                demand_pct,
-            )
+            ctx = self._startup_context(outdoor_c, demand_pct)
+            decision = self._resolve_startup_decision(ctx)
+            report = run_startup(ctx, self.startup_progress, decision)
             summary = self._record_operation(op_id, "startup", report)
             self._operations += 1
+            if report["ok"]:
+                # 投运彻底结案，清掉在途进度；下一次启动即 fresh。
+                self.startup_progress.clear()
             self._persist()
             return {**report, **summary, "station": station}
+
+    def _startup_context(self, outdoor_c: float, demand_pct: float) -> StartupContext:
+        """装配一次投运执行上下文。"""
+
+        return StartupContext(
+            source=self.source,
+            curve=self.curve,
+            network=self.network,
+            loop=self.secondary,
+            pump=self.pump,
+            valve=self.valves[sorted(self.valves)[0]],
+            durable=self.durable,
+            config=self.config,
+            now=self.clock.now(),
+            outdoor_c=float(outdoor_c),
+            demand_pct=float(demand_pct),
+        )
+
+    def _resolve_startup_decision(self, ctx: StartupContext):
+        """出续作决议：判定 → 落盘 → 审计，三处共用同一份对象。"""
+
+        decision = plan_resume(ctx, self.startup_progress)
+        saved = self.startup_progress.save_decision(decision.as_dict(), ctx.now)
+        self._publish_decision(saved)
+        return decision
+
+    def _publish_decision(self, saved: dict) -> None:
+        migration = saved.get("migration", {})
+        self.bus.publish(
+            Event.of(
+                "recovery",
+                "recovery",
+                "startup_resume_decision",
+                severity="notice" if saved["decision"] != "abort" else "alarm",
+                message=f"投运续作决议：{saved['label']}（{saved['target_stage']}）",
+                decision=saved["decision"],
+                target_stage=saved["target_stage"],
+                interrupted_stage=saved.get("interrupted_stage", ""),
+                reason=saved.get("reason", ""),
+            )
+        )
+        self.bus.publish(
+            Event.of(
+                "recovery",
+                "recovery",
+                "parameter_verification",
+                severity="notice" if migration.get("ok") else "warning",
+                message="参数核对（迁移）通过" if migration.get("ok") else "参数核对（迁移）未通过",
+                ok=bool(migration.get("ok")),
+                mismatches=list(migration.get("mismatches", [])),
+            )
+        )
+
+    def _startup_recovery_brief(self) -> dict:
+        """续作状态的精简口径，供 status 快照与控制台列表共用。"""
+
+        progress = self.startup_progress.load()
+        decision = self.startup_progress.load_decision()
+        return {
+            "in_flight": bool(progress),
+            "current_stage": progress.get("current_stage"),
+            "decision": decision.get("decision"),
+            "target_stage": decision.get("target_stage"),
+        }
+
+    def startup_recovery_report(self, *, refresh: bool = False) -> dict:
+        """只读视图：在途投运的进度、现场与续作决议。
+
+        在途时默认现算一次决议（参数核对=迁移必跑），并把同一份决议落盘、发审计，
+        保证控制台展示、审计与执行器读到的口径一致；``refresh=False`` 时只返回最近
+        一次已落盘决议，不重复刷审计。
+        """
+
+        progress = self.startup_progress.load()
+        params = progress.get("params", {}) if progress else {}
+        ctx = self._startup_context(
+            float(params.get("outdoor_c", 0.0)), float(params.get("demand_pct", 0.0))
+        )
+        if not progress:
+            decision = plan_resume(ctx, self.startup_progress)
+            return {
+                "in_flight": False,
+                "progress": {},
+                "decision": decision.as_dict(),
+                "field": field_snapshot(ctx),
+            }
+        if refresh:
+            decision = plan_resume(ctx, self.startup_progress)
+            self._publish_decision(
+                self.startup_progress.save_decision(decision.as_dict(), ctx.now)
+            )
+        return {
+            "in_flight": True,
+            "progress": progress,
+            "decision": self.startup_progress.load_decision(),
+            "field": field_snapshot(ctx),
+        }
 
     def shutdown(self, reason: str = "planned-shutdown") -> dict:
         """停运平台。"""
@@ -816,6 +931,7 @@ class Platform:
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "ids_issued": self.ids.issued(),
+            "startup_recovery": self._startup_recovery_brief(),
         }
 
     def snapshot(self) -> dict:
@@ -849,9 +965,11 @@ class Platform:
         return record
 
     def reset_state(self) -> bool:
-        """清掉落盘的平台计数（交付前重新标定用）。"""
+        """清掉落盘的平台计数与在途投运进度（交付前重新标定用）。"""
 
-        if not self.store.exists("platform_state"):
+        existed = self.store.exists("platform_state")
+        self.startup_progress.clear()
+        if not existed:
             return False
         return self.store.remove("platform_state")
 

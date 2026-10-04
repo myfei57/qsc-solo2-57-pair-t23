@@ -100,6 +100,15 @@ class SecondaryLoop:
         self._return_c += max(0.0, float(heat_fraction)) * 12.0
         return self._return_c
 
+    def restore(
+        self, *, supply_c: float, return_c: float, pressure_kpa: float
+    ) -> None:
+        """按落盘进度把二次网现场重建到内存（仅装配期恢复调用）。"""
+
+        self._supply_c = float(supply_c)
+        self._return_c = float(return_c)
+        self._pressure_kpa = max(0.0, float(pressure_kpa))
+
     def makeup_step(self, dt: float) -> float:
         """推进一次补水：低于门限才补，补到目标就停。"""
 

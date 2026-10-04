@@ -15,6 +15,37 @@ def test_api_returns_status_and_routes(platform):
     assert "/api/dispatch" in paths
     assert "/api/station/{name}" in paths
     assert "/api/zone/{name}" in paths
+    assert "/api/startup/recovery" in paths
+
+
+def test_api_startup_recovery_reports_decision(platform):
+    from heatnet.recovery import run_startup
+
+    class _Halt(Exception):
+        pass
+
+    platform.start()
+
+    def halt(stage, step):
+        if stage == "quantity" and step == "set_flow":
+            raise _Halt()
+
+    ctx = platform._startup_context(-8.0, 60.0)
+    decision = platform._resolve_startup_decision(ctx)
+    try:
+        run_startup(ctx, platform.startup_progress, decision, halt=halt)
+    except _Halt:
+        pass
+
+    api = Api(platform)
+    status, payload = api.handle("GET", "/api/startup/recovery", {}, {})
+    assert status == 200
+    assert payload["in_flight"] is True
+    assert payload["progress"]["current_stage"] == "quantity"
+    assert payload["decision"]["decision"] == "resume"
+    assert payload["decision"]["target_stage"] == "quantity"
+    # 决议、现场、进度在同一份视图里。
+    assert payload["field"]["source_flow_t_h"] > 0.0
 
 
 def test_api_unknown_path_and_station_are_404(platform):

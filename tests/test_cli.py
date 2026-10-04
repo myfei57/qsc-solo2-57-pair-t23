@@ -66,6 +66,14 @@ def test_reset_command_reports_removed_flag(tmp_path, capsys):
     assert payload["platform_state_removed"] is False
 
 
+def test_resume_command_reports_fresh_without_in_flight(tmp_path, capsys):
+    exit_code = main(["resume", "--storage-root", str(tmp_path / "state")])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["in_flight"] is False
+    assert payload["decision"]["decision"] == "fresh"
+
+
 def test_load_config_file_is_used(tmp_path, capsys):
     from heatnet.config import config_to_mapping, default_config
 

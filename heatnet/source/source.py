@@ -196,6 +196,33 @@ class HeatSource:
             self._state = IDLE
             return self._state
 
+    def restore(
+        self,
+        *,
+        state: str,
+        temperature_c: float,
+        flow_t_h: float,
+        target_c: float,
+        quality_hold_s: float,
+    ) -> str:
+        """按落盘的投运进度把热源现场重建到内存（仅装配期恢复调用）。
+
+        正常运行只允许经 :meth:`fire`/:meth:`settle_quality`/:meth:`set_flow` 推进
+        状态；这里是重启后的现场重建入口，不重放任何联锁，只把盘上确认过的现场
+        一次性装回来。
+        """
+
+        with self._guard:
+            if state not in (IDLE, QUALITY, QUANTITY, ONLINE):
+                raise InterlockError(f"不能恢复到热源状态 {state!r}", component="source")
+            self._state = state
+            self._temperature_c = float(temperature_c)
+            self._flow_t_h = float(flow_t_h)
+            self._target_c = float(target_c)
+            self._quality_hold_s = max(0.0, float(quality_hold_s))
+            self._trip_reason = ""
+            return self._state
+
     def snapshot(self) -> SourceSnapshot:
         """返回热源状态快照，温度与流量在同一把锁里一起取。"""
 

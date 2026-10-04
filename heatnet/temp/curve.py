@@ -99,6 +99,16 @@ class HeatCurve:
 
         return (float(now) - self._updated_at) > self._limits.stale_after_s
 
+    def restore(
+        self, *, outdoor_c: float, supply_c: float, epoch: int, updated_at: float
+    ) -> None:
+        """按落盘进度把曲线现场重建到内存（仅装配期恢复调用）。"""
+
+        self._outdoor_c = float(outdoor_c)
+        self._supply_c = float(supply_c)
+        self._epoch = max(0, int(epoch))
+        self._updated_at = float(updated_at)
+
     def snapshot(self, now: float) -> CurveSnapshot:
         """返回曲线状态快照。"""
 
