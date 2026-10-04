@@ -196,6 +196,22 @@ class HeatSource:
             self._state = IDLE
             return self._state
 
+    def restore_quality_confirmed(self, temperature_c: float) -> None:
+        """重启恢复：重建"调质已确认"这一内存前提。
+
+        调质确认时间只在内存累积，掉电即失效；进度文档证明该阶段边界已确认时，
+        用它把热源恢复到"调质确认、等待调量"，而不是把物理调质再跑一遍（已完成
+        步骤不许做第二遍）。仅限续作恢复路径调用。
+        """
+
+        with self._guard:
+            if self._state == TRIPPED:
+                raise InterlockError("热源已停机，不能恢复调质确认态", component="source")
+            self._target_c = float(temperature_c)
+            self._temperature_c = float(temperature_c)
+            self._quality_hold_s = self._limits.quality_confirm_s
+            self._state = QUANTITY
+
     def snapshot(self) -> SourceSnapshot:
         """返回热源状态快照，温度与流量在同一把锁里一起取。"""
 

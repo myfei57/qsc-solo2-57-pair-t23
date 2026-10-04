@@ -74,9 +74,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     config = load_config(config_path) if config_path else default_config()
     platform = build_platform(config, clock=clock, storage_root=getattr(args, "storage_root", None))
 
-    # 演示从干净基线起步：先清掉上一轮落盘的平台计数，并解除上一轮演示结束时
-    # 留下的停机保护，否则这一次会直接从带故障的状态起跑。
+    # 演示从干净基线起步：先清掉上一轮落盘的平台计数与投运进度，并解除上一轮演示
+    # 结束时留下的停机保护，否则这一次会被当成"已完成投运的重启续作"，从 finished
+    # 直接短路，物理链路根本不会再跑一遍。
     platform.reset_state()
+    platform.resume.clear_progress()
     if platform.source.state() == "tripped":
         platform.reset_source("demo-baseline")
 

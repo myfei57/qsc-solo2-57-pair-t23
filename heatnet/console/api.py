@@ -58,6 +58,9 @@ class Api:
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/resume", self._resume)
+        add("POST", "/api/resume/confirm", self._resume_confirm)
+        add("POST", "/api/resume/progress", self._resume_progress)
         add("POST", "/api/weather", self._weather)
         add("POST", "/api/adjust", self._adjust)
         add("POST", "/api/startup", self._startup)
@@ -247,6 +250,34 @@ class Api:
             "last_audit_ts": platform.audit.tail(1)[-1]["ts"] if platform.audit.tail(1) else None,
         }
         return {"ready": all(checks.values()), "checks": checks, "info": info}
+
+    def _resume(self, params: dict, body: dict) -> dict:
+        """续作决议与按阶段策略；给室外温/负荷则现场重算一次决议。"""
+
+        platform = self._platform
+        outdoor = params.get("outdoor_c")
+        demand = params.get("demand_pct")
+        if outdoor is not None and demand is not None:
+            return platform.resume_status(float(outdoor), float(demand))
+        return platform.resume_status()
+
+    def _resume_confirm(self, params: dict, body: dict) -> dict:
+        """现场按当前参数重新确认迁移核对，核对通过后才允许续作。"""
+
+        return self._platform.confirm_startup_params(
+            _as_float(body, "outdoor_c", 0.0),
+            _as_float(body, "demand_pct", 60.0),
+        )
+
+    def _resume_progress(self, params: dict, body: dict) -> dict:
+        """按现场核对结果重写投运进度边界（运维恢复）。"""
+
+        completed = body.get("completed") or []
+        return self._platform.rewrite_startup_progress(
+            str(body.get("stage", "")),
+            bool(body.get("running", False)),
+            [str(item) for item in completed],
+        )
 
     # ---- 动作 ---------------------------------------------------------
 

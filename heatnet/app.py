@@ -31,6 +31,14 @@ from .quota.accumulator import QuotaAccumulator
 from .quota.billing import billing_lines
 from .quota.meter import HeatMeter
 from .quota.quota import QuotaLedger
+from .resume import (
+    DONE as RESUME_DONE,
+    ROLLBACK as RESUME_ROLLBACK,
+    WEATHER as RESUME_WEATHER,
+    StartupProgress,
+    ResumeManager,
+    normalise_params,
+)
 from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
 from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant, startup_plant
@@ -89,6 +97,8 @@ class Platform:
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
+        self.resume_progress = StartupProgress(store)
+        self.resume = ResumeManager(self.resume_progress, self.clock, self.bus)
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=self.config.quota.sample_period_s)
@@ -292,10 +302,52 @@ class Platform:
         return self.shutdown("planned-shutdown")
 
     def startup(self, outdoor_c: float, demand_pct: float = 60.0, station: str = "console") -> dict:
-        """按调度链顺序把平台从冷态带到带负荷。"""
+        """按调度链顺序把平台从冷态带到带负荷。
+
+        重启后再次调用时，先按落盘进度与当前参数做迁移核对、产出续作决议：
+        参数没核对或停机期间被改过又没重新确认，一律拒绝续作；决议为退回则先把
+        现场退回安全态再从气象重做；决议为续做则从指定阶段起步，已确认阶段与
+        已完成步骤不做第二遍。
+        """
 
         with self._lock:
             op_id = self.ids.next()
+            params = self.startup_params(outdoor_c, demand_pct)
+            decision = self.resume.resume_decision(params)
+
+            if decision.decision == "blocked":
+                # 直接抛迁移门的联锁原因（漂移/未核对），由控制台落 409、审计落账。
+                self.resume.reconcile(params).require_passed()
+                decision.require_allowed()  # 兜底：非迁移原因的阻断也不放行
+            if decision.decision == "finished":
+                return {
+                    "ok": True,
+                    "stage": RESUME_DONE,
+                    "steps": [],
+                    "violations": [],
+                    "resume": decision.as_dict(),
+                    "station": station,
+                    "op_id": op_id,
+                    # 链已完成：按现场当前态给出汇总口径，供下游报告直接读取。
+                    "flow_t_h": round(self.source.flow_t_h(), 2),
+                    "supply_c": round(self.source.temperature_c(), 2),
+                    "return_c": round(self.secondary.return_c(), 2),
+                    "resumed_from": None,
+                    "executed": [],
+                }
+            if decision.decision == RESUME_ROLLBACK:
+                rollback = self.resume.rollback_to_safe(
+                    self.source,
+                    self.network,
+                    self.pump,
+                    self.valves[sorted(self.valves)[0]],
+                    reason=f"resume-rollback@{decision.stage}",
+                )
+            else:
+                rollback = None
+
+            resume_from = decision.resume_from or RESUME_WEATHER
+            completed = set(self.resume.progress().get("completed", []))
             report = startup_plant(
                 self.source,
                 self.curve,
@@ -307,11 +359,83 @@ class Platform:
                 outdoor_c,
                 self.clock.now(),
                 demand_pct,
+                resume_from=resume_from,
+                completed=completed,
+                progress=self.resume_progress,
+                chain=self.resume.chain,
+                op_id=op_id,
+                params=normalise_params(params),
+                clock_now=self.clock.now,
             )
             summary = self._record_operation(op_id, "startup", report)
             self._operations += 1
             self._persist()
-            return {**report, **summary, "station": station}
+            return {
+                **report,
+                **summary,
+                "station": station,
+                "resume": decision.as_dict(),
+                "rollback": rollback,
+            }
+
+    def startup_params(self, outdoor_c: float, demand_pct: float = 60.0) -> dict:
+        """采集本次投运所依据、需要纳入迁移核对的参数。"""
+
+        return normalise_params(
+            {
+                "outdoor_c": float(outdoor_c),
+                "demand_pct": float(demand_pct),
+                "curve_supply_c": self.curve.table.interpolate(float(outdoor_c)),
+                "supply_target_c": self.config.source.supply_target_c,
+                "quality_confirm_s": self.config.source.quality_confirm_s,
+                "flow_min_t_h": self.config.source.flow_min_t_h,
+                "flow_max_t_h": self.config.source.flow_max_t_h,
+                "makeup_target_kpa": self.config.secondary.makeup_target_kpa,
+                "makeup_min_kpa": self.config.secondary.makeup_min_kpa,
+                "makeup_max_kpa": self.config.secondary.makeup_max_kpa,
+            }
+        )
+
+    def resume_status(self, outdoor_c: float | None = None, demand_pct: float | None = None) -> dict:
+        """返回投运进度、最近续作决议与按阶段策略（供控制台展示）。"""
+
+        progress = self.resume.progress()
+        current = None
+        decision = self.resume.last_decision()
+        if outdoor_c is not None and demand_pct is not None:
+            current = self.startup_params(outdoor_c, demand_pct)
+            decision = self.resume.resume_decision(current).as_dict()
+        return {
+            "progress": progress,
+            "decision": decision,
+            "policies": self.resume.overview(),
+            "current_params": current,
+        }
+
+    def confirm_startup_params(self, outdoor_c: float, demand_pct: float = 60.0) -> dict:
+        """现场按当前参数重新确认迁移核对；核对通过后才允许续作。"""
+
+        with self._lock:
+            params = self.startup_params(outdoor_c, demand_pct)
+            return self.resume.confirm_params(params)
+
+    def rewrite_startup_progress(self, stage: str, running: bool, completed: list[str]) -> dict:
+        """按现场核对结果重写投运进度边界（运维恢复用），返回最新进度。"""
+
+        with self._lock:
+            snapshot = self.resume.progress()
+            self.resume.save_progress(
+                {
+                    "chain": self.resume.chain,
+                    "op_id": snapshot.get("op_id", ""),
+                    "stage": stage,
+                    "running": bool(running),
+                    "completed": list(completed),
+                    "params": dict(snapshot.get("params", {})),
+                    "updated_at": self.clock.now(),
+                }
+            )
+            return self.resume.progress()
 
     def shutdown(self, reason: str = "planned-shutdown") -> dict:
         """停运平台。"""
@@ -815,6 +939,11 @@ class Platform:
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "resume": {
+                "progress": self.resume.progress(),
+                "decision": self.resume.last_decision(),
+                "granularity": "stage",
+            },
             "ids_issued": self.ids.issued(),
         }
 
